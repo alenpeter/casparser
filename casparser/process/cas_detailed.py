@@ -44,10 +44,10 @@ ParsedTransaction = namedtuple(
 )
 
 
-def str_to_decimal(value: Optional[str]) -> Decimal:
+def str_to_decimal(value: Optional[str]) -> Optional[Decimal]:
     if isinstance(value, str):
         return Decimal(value.replace(",", "_").replace("(", "-"))
-
+    return None
 
 def parse_header(text):
     """
@@ -133,6 +133,7 @@ def parse_transaction(line) -> Optional[ParsedTransaction]:
         if m := re.search(regex, line, re.DOTALL | re.MULTILINE | re.I):
             groups = m.groups()
             date = description = amount = units = nav = balance = None
+
             if groups.count(None) == 3:
                 # Tax entries
                 date, description, amount, *_ = groups
@@ -146,8 +147,10 @@ def parse_transaction(line) -> Optional[ParsedTransaction]:
             elif groups.count(None) == 0:
                 # Normal entries
                 date, description, amount, units, nav, balance = groups
+
             if date is not None:
                 return ParsedTransaction(date, description, amount, units, nav, balance)
+    return None
 
 
 def process_detailed_text(text):
@@ -159,18 +162,32 @@ def process_detailed_text(text):
     hdr_data = parse_header(text[:1000])
     statement_period = StatementPeriod(from_=hdr_data["from"], to=hdr_data["to"])
 
+    # Initialize processing variables
     folios: Dict[str, Folio] = {}
     current_folio = None
     current_amc = None
     curr_scheme_data: Optional[Scheme] = None
+
+    # Split text into lines
     lines = text.split("\u2029")
-    for idx, line in enumerate(lines):
-        # Parse schemes with long names (single line) effectively pushing
-        # "Registrar" column to the previous line
-        if re.search(REGISTRAR_RE, line):
-            line = "\t\t".join([lines[idx + 1], line])
+    idx = 0
+
+    while idx < len(lines):
+        line = lines[idx].strip()
+
+        # Handle registrar lines
+        if re.search(REGISTRAR_RE, line) and idx + 1 < len(lines):
+            next_line = lines[idx + 1].strip()
+            # Only join if next line isn't a transaction
+            if not re.search(r'\d{2}-[A-Za-z]{3}-\d{4}', next_line):
+                line = "\t\t".join([next_line, line])
+                idx += 1
+
+        # Process AMC
         if amc_match := re.search(AMC_RE, line, re.I | re.DOTALL):
             current_amc = amc_match.group(0)
+
+        # Process Folio
         elif m := re.search(FOLIO_RE, line):
             folio = m.group(1).strip()
             if current_folio is None or current_folio != folio:
@@ -179,6 +196,7 @@ def process_detailed_text(text):
                     curr_scheme_data = None
                 current_folio = folio
 
+                # Process folio details
                 pan = ""
                 kyc = None
                 pankyc = None
@@ -200,22 +218,28 @@ def process_detailed_text(text):
                         PANKYC=pankyc,
                         schemes=[],
                     )
+
+        # Process Scheme
         elif m := re.search(SCHEME_RE, line, re.DOTALL | re.MULTILINE | re.I):
             if current_folio is None:
                 raise CASParseError("Layout Error! Scheme found before folio entry.")
+
             scheme = get_parsed_scheme_name(m.group("name"))
             if curr_scheme_data is None or curr_scheme_data.scheme != scheme:
                 if curr_scheme_data:
                     folios[current_folio].schemes.append(curr_scheme_data)
 
+            # Process scheme metadata
             match_pairs = re.findall(SCHEME_KV_RE, line, re.DOTALL | re.MULTILINE | re.I)
             metadata: Dict[str, str] = {}
             for key, value in match_pairs:
                 metadata[key.strip().lower()] = value.strip()
+
             isin_ = metadata.get("isin")
             rta_code = m.group("code").strip()
             rta = m.group("rta").strip()
             isin, amfi, scheme_type = isin_search(scheme, rta, rta_code, isin=isin_)
+
             curr_scheme_data = Scheme(
                 scheme=scheme,
                 advisor=metadata.get("advisor"),
@@ -228,59 +252,85 @@ def process_detailed_text(text):
                 close=Decimal(0.0),
                 close_calculated=Decimal(0.0),
                 valuation=SchemeValuation(
-                    date=statement_period.to, value=Decimal(0.0), nav=Decimal(0.0)
+                    date=statement_period.to,
+                    value=Decimal(0.0),
+                    nav=Decimal(0.0)
                 ),
                 transactions=[],
             )
+
         if not curr_scheme_data:
+            idx += 1
             continue
+
+        # Process scheme details
         if m := re.search(NOMINEE_RE, line, re.I | re.DOTALL):
             curr_scheme_data.nominees.extend([x.strip() for x in m.groups() if x.strip()])
-        if m := re.search(OPEN_UNITS_RE, line):
+
+        elif m := re.search(OPEN_UNITS_RE, line):
             curr_scheme_data.open = Decimal(m.group(1).replace(",", "_"))
             curr_scheme_data.close_calculated = curr_scheme_data.open
-            continue
-        if m := re.search(CLOSE_UNITS_RE, line):
+
+        elif m := re.search(CLOSE_UNITS_RE, line):
             curr_scheme_data.close = Decimal(m.group(1).replace(",", "_"))
-        if m := re.search(COST_RE, line, re.I):
+
+        elif m := re.search(COST_RE, line, re.I):
             curr_scheme_data.valuation.cost = Decimal(m.group(1).replace(",", "_"))
-        if m := re.search(VALUATION_RE, line, re.I):
+
+        elif m := re.search(VALUATION_RE, line, re.I):
             curr_scheme_data.valuation.date = date_parser.parse(m.group(1)).date()
             curr_scheme_data.valuation.value = Decimal(m.group(2).replace(",", "_"))
-        if m := re.search(NAV_RE, line, re.I):
+
+        elif m := re.search(NAV_RE, line, re.I):
             curr_scheme_data.valuation.date = date_parser.parse(m.group(1)).date()
             curr_scheme_data.valuation.nav = Decimal(m.group(2).replace(",", "_"))
-            continue
-        description_tail = ""
-        if m := re.search(DESCRIPTION_TAIL_RE, line):
-            description_tail = m.group(1).strip()
-            line = line.replace(m.group(1), "")
-        if parsed_txn := parse_transaction(line):
-            date = date_parser.parse(parsed_txn.date).date()
-            desc = parsed_txn.description.strip()
-            if description_tail != "":
-                desc = " ".join([desc, description_tail])
-            amt = str_to_decimal(parsed_txn.amount)
-            units = str_to_decimal(parsed_txn.units)
-            nav = str_to_decimal(parsed_txn.nav)
-            balance = str_to_decimal(parsed_txn.balance)
-            txn_type, dividend_rate = get_transaction_type(desc, units)
-            if units is not None:
-                curr_scheme_data.close_calculated += units
-            curr_scheme_data.transactions.append(
-                TransactionData(
-                    date=date,
-                    description=desc,
-                    amount=amt,
-                    units=units,
-                    nav=nav,
-                    balance=balance,
-                    type=txn_type.name,
-                    dividend_rate=dividend_rate,
-                )
-            )
+
+        # Process transactions
+        else:
+            # Handle description tail
+            description_tail = ""
+            if m := re.search(DESCRIPTION_TAIL_RE, line):
+                description_tail = m.group(1).strip()
+                line = line.replace(m.group(1), "")
+
+            # Only process if line contains a transaction date
+            if re.search(r'\d{2}-[A-Za-z]{3}-\d{4}', line):
+                if parsed_txn := parse_transaction(line):
+                    # Process transaction data
+                    date = date_parser.parse(parsed_txn.date).date()
+                    desc = parsed_txn.description.strip()
+                    if description_tail:
+                        desc = " ".join([desc, description_tail])
+
+                    amt = str_to_decimal(parsed_txn.amount)
+                    units = str_to_decimal(parsed_txn.units)
+                    nav = str_to_decimal(parsed_txn.nav)
+                    balance = str_to_decimal(parsed_txn.balance)
+
+                    txn_type, dividend_rate = get_transaction_type(desc, units)
+
+                    if units is not None:
+                        curr_scheme_data.close_calculated += units
+
+                    curr_scheme_data.transactions.append(
+                        TransactionData(
+                            date=date,
+                            description=desc,
+                            amount=amt,
+                            units=units,
+                            nav=nav,
+                            balance=balance,
+                            type=txn_type.name,
+                            dividend_rate=dividend_rate,
+                        )
+                    )
+
+        idx += 1
+
+    # Add final scheme data if exists
     if curr_scheme_data:
         folios[current_folio].schemes.append(curr_scheme_data)
+
     return ProcessedCASData(
         cas_type=CASFileType.DETAILED,
         statement_period=statement_period,
